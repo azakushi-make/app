@@ -25,14 +25,24 @@ class TelegramBot:
         self.forense = forense
         self.veto = veto
 
-        self.token = config["telegram"]["token"]
-        self.chat_id = str(config["telegram"]["chat_id"])
-        self.groq_key = config["groq"]["api_key"]
-        self.groq_model = config["groq"].get("model", "llama-3.3-70b-versatile")
+        tg = config.get("telegram", {})
+        # Support both "token" and "bot_token" field names
+        self.token = tg.get("token", tg.get("bot_token", ""))
+        self.chat_id = str(tg.get("chat_id", ""))
+        self.groq_key = config.get("groq", {}).get("api_key", "")
+        self.groq_model = config.get("groq", {}).get("model", "llama-3.3-70b-versatile")
 
-        self.application = Application.builder().token(self.token).build()
-        self._register_handlers()
-        logger.info("🤖 TelegramBot inicializado")
+        if self.token:
+            try:
+                self.application = Application.builder().token(self.token).build()
+                self._register_handlers()
+                logger.info("TelegramBot initialized")
+            except Exception as exc:
+                logger.error("TelegramBot init error: %s — bot disabled", exc)
+                self.application = None
+        else:
+            logger.warning("TelegramBot: no token configured — bot disabled")
+            self.application = None
 
     def _register_handlers(self):
         self.application.add_handler(CommandHandler("start", self.cmd_start))

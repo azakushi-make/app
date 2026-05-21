@@ -108,7 +108,12 @@ class TradingEngine:
         self.forense = forense
 
         tp = config.get("trading_params", {})
-        self.min_confidence: float = float(tp.get("min_confidence", 60.0))
+        # Support both field name variants
+        self.min_confidence: float = float(
+            tp.get("min_confidence",
+            tp.get("min_confidence_execution",
+            tp.get("min_confidence_signal", 60.0)))
+        )
         self.order_qty: int = int(tp.get("order_qty", 1))
 
         alpaca = config.get("alpaca", {})
