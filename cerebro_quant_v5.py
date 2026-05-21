@@ -579,16 +579,298 @@ class WhaleTracker:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6. VETO ENGINE — 5 vetos en cadena (sesión → PIN → macro → forense → whale)
+# 6a. SPREAD FILTER — Bloquea si bid/ask spread > umbral
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SpreadFilter:
+    def __init__(self, config: dict) -> None:
+        alpaca = config.get("alpaca", {})
+        self.key    = alpaca.get("api_key", "")
+        self.secret = alpaca.get("secret_key", "")
+        self.url    = alpaca.get("base_url", "https://paper-api.alpaca.markets").rstrip("/")
+        self.max_spread_pct = 0.05  # 5 basis points
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _sess(self) -> aiohttp.ClientSession:
+        if not self._session or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8))
+        return self._session
+
+    async def get_spread_pct(self, symbol: str) -> Optional[float]:
+        if not self.key:
+            return None
+        try:
+            url = f"{self.url}/v2/stocks/{symbol}/quotes/latest"
+            headers = {"APCA-API-KEY-ID": self.key, "APCA-API-SECRET-KEY": self.secret}
+            async with (await self._sess()).get(url, headers=headers) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json()
+                q = data.get("quote", {})
+                ask, bid = float(q.get("ap", 0) or 0), float(q.get("bp", 0) or 0)
+                if bid <= 0 or ask <= 0:
+                    return None
+                return round((ask - bid) / bid * 100, 4)
+        except Exception as exc:
+            logger.debug("SpreadFilter %s: %s", symbol, exc)
+            return None
+
+    async def is_ok(self, symbol: str) -> tuple:
+        spread = await self.get_spread_pct(symbol)
+        if spread is None:
+            return True, "OK (spread no disponible)"
+        if spread > self.max_spread_pct:
+            return False, f"Spread alto: {spread:.4f}% > {self.max_spread_pct}%"
+        return True, f"Spread OK: {spread:.4f}%"
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6b. MONTE CARLO SIMULATOR — Probabilidad de pérdida antes de operar
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MonteCarloSimulator:
+    def __init__(self, n_sims: int = 1000, horizon: int = 10,
+                 max_loss_pct: float = 5.0, max_prob: float = 0.20) -> None:
+        self.n_sims      = n_sims
+        self.horizon     = horizon
+        self.max_loss_pct = max_loss_pct
+        self.max_prob    = max_prob
+
+    def _simulate(self, price: float, vol_pct: float, side: str) -> tuple:
+        try:
+            sigma = max(0.005, (vol_pct / 100.0) / math.sqrt(252))
+            losses = 0
+            for _ in range(self.n_sims):
+                p = price
+                for _ in range(self.horizon):
+                    p *= math.exp(-0.5 * sigma**2 + sigma * np.random.standard_normal())
+                pnl_pct = ((p - price) / price * 100) if side.upper() == "BUY" \
+                          else ((price - p) / price * 100)
+                if pnl_pct < -self.max_loss_pct:
+                    losses += 1
+            prob = losses / self.n_sims
+            if prob > self.max_prob:
+                return False, (f"MonteCarlo: P(pérdida>{self.max_loss_pct}%)="
+                               f"{prob:.1%} > {self.max_prob:.1%}")
+            return True, f"MonteCarlo OK: P(pérdida>{self.max_loss_pct}%)={prob:.1%}"
+        except Exception as exc:
+            logger.error("MonteCarloSimulator: %s", exc)
+            return True, "OK (MC error — permitido)"
+
+    async def check(self, symbol: str, price: float, vol_pct: float, side: str) -> tuple:
+        loop = asyncio.get_running_loop()
+        ok, reason = await loop.run_in_executor(None, self._simulate, price, vol_pct, side)
+        if not ok:
+            logger.warning("MonteCarlo [%s/%s]: %s", symbol, side, reason)
+        return ok, reason
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6c. EXECUTION ALGO — TWAP y VWAP para fragmentar órdenes grandes
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ExecutionAlgo:
+    def __init__(self, config: dict) -> None:
+        alpaca = config.get("alpaca", {})
+        self.key    = alpaca.get("api_key", "")
+        self.secret = alpaca.get("secret_key", "")
+        self.url    = alpaca.get("base_url", "https://paper-api.alpaca.markets").rstrip("/")
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _sess(self) -> aiohttp.ClientSession:
+        if not self._session or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+        return self._session
+
+    async def _submit(self, symbol: str, side: str, qty: int) -> Optional[dict]:
+        try:
+            headers = {"APCA-API-KEY-ID": self.key,
+                       "APCA-API-SECRET-KEY": self.secret,
+                       "Content-Type": "application/json"}
+            payload = {"symbol": symbol, "qty": str(qty),
+                       "side": side.lower(), "type": "market", "time_in_force": "day"}
+            async with (await self._sess()).post(
+                f"{self.url}/v2/orders", json=payload, headers=headers
+            ) as r:
+                data = await r.json()
+                return data if r.status in (200, 201) else None
+        except Exception as exc:
+            logger.error("ExecutionAlgo._submit %s: %s", symbol, exc)
+            return None
+
+    async def twap(self, symbol: str, side: str, qty: int,
+                   slices: int = 4, interval: float = 15.0) -> list:
+        """Divide qty en slices iguales ejecutados cada `interval` segundos."""
+        if qty <= 1:
+            o = await self._submit(symbol, side, qty)
+            return [o] if o else []
+        orders, remaining = [], qty
+        slice_qty = max(1, qty // slices)
+        logger.info("TWAP [%s/%s]: %d acciones en %d slices c/%ds", symbol, side, qty, slices, interval)
+        for i in range(slices):
+            q = slice_qty if i < slices - 1 else remaining
+            if q <= 0: break
+            o = await self._submit(symbol, side, q)
+            if o: orders.append(o); remaining -= q
+            if i < slices - 1: await asyncio.sleep(interval)
+        return orders
+
+    async def vwap(self, symbol: str, side: str, qty: int) -> list:
+        """Divide qty proporcionalmente al perfil de volumen intradiario."""
+        if qty <= 1:
+            o = await self._submit(symbol, side, qty)
+            return [o] if o else []
+        # Pesos por media hora (apertura y cierre tienen más volumen)
+        profile = [0.18,0.12,0.08,0.07,0.06,0.06,0.06,0.06,0.07,0.08,0.08,0.08,0.10]
+        total_w = sum(profile)
+        orders, remaining = [], qty
+        for i, w in enumerate(profile):
+            if remaining <= 0: break
+            q = min(max(1, round(qty * w / total_w)), remaining)
+            o = await self._submit(symbol, side, q)
+            if o: orders.append(o); remaining -= q
+            if i < len(profile) - 1: await asyncio.sleep(30.0)
+        return orders
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6d. RETRAIN MANAGER — Reentrenamiento automático semanal de las IAs
+# ══════════════════════════════════════════════════════════════════════════════
+
+class RetrainManager:
+    def __init__(self, config: dict, price_feed: "PriceFeed",
+                 telegram_alert_fn: Optional[Callable] = None) -> None:
+        self.config = config
+        self.price_feed = price_feed
+        self.telegram_alert_fn = telegram_alert_fn
+        self.symbols    = config.get("trading_params", {}).get("simbolos", ["SPY", "QQQ"])
+        self.retrain_log = BRAIN_DIR / "retrain_log.json"
+
+    async def _collect(self, symbol: str, days: int = 30) -> list:
+        try:
+            loop = asyncio.get_running_loop()
+            def _fetch():
+                import yfinance as yf
+                hist = yf.Ticker(symbol).history(period=f"{days}d", interval="1h")
+                if hist.empty: return []
+                closes = hist["Close"].tolist()
+                records = []
+                for i in range(14, len(closes)):
+                    w = closes[max(0,i-29):i+1]
+                    gains  = [max(0,w[j]-w[j-1]) for j in range(1,len(w))]
+                    losses = [max(0,w[j-1]-w[j]) for j in range(1,len(w))]
+                    ag = sum(gains[-14:]) / min(len(gains),14)
+                    al = sum(losses[-14:]) / min(len(losses),14)
+                    rsi = 100.0 if al==0 else 100-100/(1+ag/al)
+                    def ema(d,p):
+                        k,e=2/(p+1),d[0]
+                        [e:=v*k+e*(1-k) for v in d[1:]]; return e
+                    macd = ema(w,12)-ema(w,26)
+                    pc1 = (w[-1]-w[-2])/w[-2]*100 if len(w)>=2 else 0
+                    pc5 = (w[-1]-w[-6])/w[-6]*100 if len(w)>=6 else 0
+                    label = max(-1.0, min(1.0,
+                        (closes[i+1]-closes[i])/closes[i]*100)) if i+1<len(closes) else 0.0
+                    records.append({"f":[rsi,macd,1.0,pc1,pc5],"y":label})
+                return records
+            return await loop.run_in_executor(None, _fetch)
+        except Exception as exc:
+            logger.error("RetrainManager._collect %s: %s", symbol, exc)
+            return []
+
+    async def retrain(self) -> dict:
+        logger.info("RetrainManager: iniciando reentrenamiento...")
+        all_X, all_y = [], []
+        for sym in self.symbols:
+            data = await self._collect(sym)
+            for r in data: all_X.append(r["f"]); all_y.append(r["y"])
+
+        metrics = {"timestamp": datetime.now(NY_TZ).isoformat(), "n_samples": len(all_X)}
+
+        if len(all_X) < 30:
+            msg = "⚠️ Reentrenamiento cancelado: datos insuficientes"
+            logger.warning(msg)
+            if self.telegram_alert_fn: await self.telegram_alert_fn(msg)
+            return metrics
+
+        try:
+            loop = asyncio.get_running_loop()
+            def _train():
+                from sklearn.linear_model import LinearRegression, Ridge, Lasso
+                from sklearn.model_selection import cross_val_score
+                X, y = np.array(all_X), np.array(all_y)
+                out = {}
+                for name, mdl in [("LR",LinearRegression()),("Ridge",Ridge(1.0)),
+                                   ("Lasso",Lasso(0.1,max_iter=2000))]:
+                    s = cross_val_score(mdl,X,y,cv=5,scoring="r2")
+                    out[name] = {"r2": round(float(s.mean()),4), "std": round(float(s.std()),4)}
+                return out
+            results = await loop.run_in_executor(None, _train)
+            metrics["scores"] = results
+
+            # Guardar log
+            log = []
+            if self.retrain_log.exists():
+                async with aiofiles.open(self.retrain_log) as fh:
+                    log = json.loads(await fh.read())
+            log.append(metrics); log = log[-52:]
+            async with aiofiles.open(self.retrain_log,"w") as fh:
+                await fh.write(json.dumps(log, indent=2, default=str))
+
+            msg = (f"✅ REENTRENAMIENTO COMPLETADO\n"
+                   f"Muestras: {len(all_X)} | Activos: {', '.join(self.symbols)}\n" +
+                   "\n".join(f"IA {k}: R²={v['r2']:.3f}±{v['std']:.3f}" for k,v in results.items()))
+            logger.info(msg.replace("\n"," | "))
+            if self.telegram_alert_fn: await self.telegram_alert_fn(msg)
+
+        except Exception as exc:
+            logger.error("RetrainManager.retrain: %s", exc)
+            metrics["error"] = str(exc)
+
+        return metrics
+
+    async def run_loop(self) -> None:
+        logger.info("RetrainManager: loop iniciado (cada domingo 18:00 NY)")
+        while True:
+            try:
+                now  = datetime.now(NY_TZ)
+                days = (6 - now.weekday()) % 7
+                nxt  = now.replace(hour=18, minute=0, second=0, microsecond=0)
+                if days > 0:   nxt += timedelta(days=days)
+                elif now.time() >= time(18,0): nxt += timedelta(days=7)
+                wait = (nxt - now).total_seconds()
+                logger.info("RetrainManager: próximo en %.1fh", wait/3600)
+                await asyncio.sleep(wait)
+                await self.retrain()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("RetrainManager.run_loop: %s", exc)
+                await asyncio.sleep(3600)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. VETO ENGINE — 7 vetos en cadena
 # ══════════════════════════════════════════════════════════════════════════════
 
 class VetoEngine:
     def __init__(self, session: SessionManager, macro: MacroFilter,
-                 forense: ForenseLogger, whale: WhaleTracker) -> None:
+                 forense: ForenseLogger, whale: WhaleTracker,
+                 spread: Optional["SpreadFilter"] = None,
+                 mc: Optional["MonteCarloSimulator"] = None) -> None:
         self.session = session
         self.macro   = macro
         self.forense = forense
         self.whale   = whale
+        self.spread  = spread
+        self.mc      = mc
 
     async def check_all(self, symbol: str, market_context: dict, side: str = "BUY") -> tuple:
         # 1. Mercado abierto
@@ -615,6 +897,23 @@ class VetoEngine:
             sentiment = await self.whale.get_sentiment(symbol)
             if self.whale.should_veto_buy(sentiment):
                 return False, f"WhaleTracker: sentimiento bajista ({sentiment:.3f})"
+
+        # 6. Spread filter
+        if self.spread is not None:
+            spread_ok, spread_reason = await self.spread.is_ok(symbol)
+            if not spread_ok:
+                logger.info("VetoEngine [%s/%s]: ✗ %s", symbol, side, spread_reason)
+                return False, spread_reason
+
+        # 7. Monte Carlo
+        if self.mc is not None:
+            price     = float(market_context.get("price", 0.0))
+            vol_pct   = float(market_context.get("volatilidad", 2.0))
+            if price > 0:
+                mc_ok, mc_reason = await self.mc.check(symbol, price, vol_pct, side)
+                if not mc_ok:
+                    logger.info("VetoEngine [%s/%s]: ✗ %s", symbol, side, mc_reason)
+                    return False, mc_reason
 
         logger.info("VetoEngine [%s/%s]: ✓ AUTORIZADO", symbol, side)
         return True, "AUTORIZADO"
@@ -657,10 +956,12 @@ class TradingEngine:
     ]
 
     def __init__(self, config: dict, veto_engine: VetoEngine,
-                 price_feed: PriceFeed, forense: ForenseLogger) -> None:
-        self.veto_engine = veto_engine
-        self.price_feed  = price_feed
-        self.forense     = forense
+                 price_feed: PriceFeed, forense: ForenseLogger,
+                 execution_algo: Optional["ExecutionAlgo"] = None) -> None:
+        self.veto_engine     = veto_engine
+        self.price_feed      = price_feed
+        self.forense         = forense
+        self.execution_algo  = execution_algo
         self.on_signal: Optional[Callable] = None
         self.on_log:    Optional[Callable] = None
 
@@ -782,6 +1083,15 @@ class TradingEngine:
         if not self.alpaca_key or not self.alpaca_secret:
             return None
         try:
+            # Use TWAP via ExecutionAlgo when available for qty > 1
+            if self.execution_algo is not None and qty > 1:
+                orders = await self.execution_algo.twap(symbol, side, qty)
+                if orders:
+                    logger.info("TWAP ejecutado: %s %s x%d → %d partes", side, symbol, qty, len(orders))
+                    return orders[0]  # return first fill for PnL tracking
+                return None
+
+            # Direct single-share market order (default / qty == 1)
             headers = {"APCA-API-KEY-ID": self.alpaca_key,
                        "APCA-API-SECRET-KEY": self.alpaca_secret,
                        "Content-Type": "application/json"}
@@ -827,7 +1137,7 @@ class TradingEngine:
                             continue
 
                         mctx = {"volatilidad": abs(features[3]), "sentimiento": vote["signal"],
-                                "rsi": features[0], "macd": features[1]}
+                                "rsi": features[0], "macd": features[1], "price": price}
                         authorized, veto_reason = await self.veto_engine.check_all(symbol, mctx, direction)
                         sig_info["authorized"]  = authorized
                         sig_info["veto_reason"] = veto_reason
@@ -868,11 +1178,15 @@ class TradingEngine:
 
 class TelegramBot:
     def __init__(self, config: dict, session: SessionManager, macro: MacroFilter,
-                 forense: ForenseLogger, veto: VetoEngine) -> None:
-        self.session = session
-        self.macro   = macro
-        self.forense = forense
-        self.veto    = veto
+                 forense: ForenseLogger, veto: VetoEngine,
+                 price_feed: Optional["PriceFeed"] = None,
+                 trading: Optional["TradingEngine"] = None) -> None:
+        self.session    = session
+        self.macro      = macro
+        self.forense    = forense
+        self.veto       = veto
+        self.price_feed = price_feed
+        self.trading    = trading
         tg = config.get("telegram", {})
         self.token   = tg.get("token", tg.get("bot_token", ""))
         self.chat_id = str(tg.get("chat_id", ""))
@@ -894,6 +1208,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("status",  self.cmd_status))
         app.add_handler(CommandHandler("macro",   self.cmd_macro))
         app.add_handler(CommandHandler("forense", self.cmd_forense))
+        app.add_handler(CommandHandler("analizar", self.cmd_analizar))
         app.add_handler(CommandHandler("ayuda",   self.cmd_start))
         app.add_handler(MessageHandler(tg_filters.TEXT & ~tg_filters.COMMAND, self.handle_text))
 
@@ -902,10 +1217,11 @@ class TelegramBot:
                "╔═══════════════════════════════════════╗\n"
                "║   🧠 CEREBRO QUANT v5 — EN LÍNEA      ║\n"
                "╚═══════════════════════════════════════╝\n\n"
-               "  /status  →  Estado mercado + sesión NY\n"
-               "  /macro   →  Calendario económico\n"
-               "  /forense →  Análisis de pérdidas\n"
-               "  /ayuda   →  Este menú\n\n"
+               "  /status         →  Estado mercado + sesión NY\n"
+               "  /macro          →  Calendario económico\n"
+               "  /forense        →  Análisis de pérdidas\n"
+               "  /analizar TICK  →  Análisis rápido de un activo\n"
+               "  /ayuda          →  Este menú\n\n"
                "O escríbeme para hablar con la IA.\n```")
         await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -941,6 +1257,62 @@ class TelegramBot:
         report = await self.forense.generar_reporte()
         for chunk in [report[i:i+4000] for i in range(0, len(report), 4000)]:
             await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
+
+    async def cmd_analizar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        args = context.args
+        if not args:
+            await update.message.reply_text(
+                "Uso: /analizar TICKER  — ejemplo: /analizar AAPL"
+            )
+            return
+        symbol = args[0].upper().strip()
+        await update.message.reply_text(f"🔍 Analizando {symbol}...")
+        try:
+            # Get price
+            price = None
+            if self.price_feed:
+                prices = await self.price_feed.get_prices_bulk([symbol])
+                price = prices.get(symbol)
+            if not price:
+                await update.message.reply_text(f"⚠️ No se pudo obtener precio para {symbol}")
+                return
+
+            # Compute features & committee vote
+            if self.trading:
+                features = self.trading._features(symbol, price)
+                rsi  = features[0]
+                macd = features[1]
+                ctx  = (f"RSI={rsi:.1f}, MACD={macd:.3f}, "
+                        f"Precio={price:.4f}, Cambio1d={features[3]:.2f}%")
+                vote = await self.trading.get_committee_vote(symbol, features, price, ctx)
+
+                votes_txt = "\n".join(
+                    f"  {k:15s}: {v:+.3f}" if v is not None else f"  {k:15s}: inactivo"
+                    for k, v in vote["votes"].items()
+                )
+                bar_len = int(abs(vote["signal"]) * 20)
+                bar_dir = "▶" * bar_len if vote["signal"] >= 0 else "◀" * bar_len
+                msg = (
+                    f"```\n"
+                    f"╔══════════════════════════════════╗\n"
+                    f"║  🔬 ANÁLISIS: {symbol:<18} ║\n"
+                    f"╚══════════════════════════════════╝\n\n"
+                    f"  Precio    : ${price:.4f}\n"
+                    f"  RSI       : {rsi:.1f}\n"
+                    f"  MACD      : {macd:.4f}\n\n"
+                    f"  Señal     : {vote['signal']:+.3f}  [{bar_dir}]\n"
+                    f"  Confianza : {vote['confidence']:.1f}%\n"
+                    f"  Dirección : {vote['direction']}\n\n"
+                    f"  VOTOS IAs :\n{votes_txt}\n"
+                    f"```"
+                )
+            else:
+                msg = f"```\n{symbol}: Precio=${price:.4f}\n```"
+
+            await update.message.reply_text(msg, parse_mode="Markdown")
+
+        except Exception as exc:
+            await update.message.reply_text(f"⚠️ Error analizando {symbol}: {exc}")
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.lower()
@@ -1135,32 +1507,49 @@ async def main() -> None:
 
     print("🧠 Iniciando Cerebro Quant v5...")
 
+    # Core modules
     session    = SessionManager()
     price_feed = PriceFeed(config)
     macro      = MacroFilter(config)
     forense    = ForenseLogger()
     whale      = WhaleTracker(config)
-    veto       = VetoEngine(session, macro, forense, whale)
-    trading    = TradingEngine(config, veto, price_feed, forense)
-    bot        = TelegramBot(config, session, macro, forense, veto)
-    dashboard  = Dashboard(session, macro, forense, whale, veto)
 
-    # Cablear callbacks de alerta
+    # New: Spread filter, Monte Carlo, ExecutionAlgo, RetrainManager
+    spread  = SpreadFilter(config)
+    mc      = MonteCarloSimulator()
+    exe     = ExecutionAlgo(config)
+    retrain = RetrainManager(config, price_feed)
+
+    # Veto chain: 7 checks
+    veto = VetoEngine(session, macro, forense, whale, spread=spread, mc=mc)
+
+    # Trading engine with TWAP execution
+    trading   = TradingEngine(config, veto, price_feed, forense, execution_algo=exe)
+
+    # Telegram bot with full access for /analizar
+    bot       = TelegramBot(config, session, macro, forense, veto,
+                            price_feed=price_feed, trading=trading)
+    dashboard = Dashboard(session, macro, forense, whale, veto)
+
+    # Wire alert callbacks
     macro.telegram_alert_fn   = bot.send_alert
     forense.telegram_alert_fn = bot.send_alert
     whale.telegram_alert_fn   = bot.send_alert
+    retrain.telegram_alert_fn = bot.send_alert
 
-    # Conectar señales al dashboard
+    # Connect signals to dashboard
     trading.on_signal = lambda sig: dashboard.signals.append(sig)
     trading.on_log    = dashboard.push_log
 
-    # Calendario inicial
+    # Load macro calendar on startup
     try:
         await macro.load_calendar_finnhub()
     except Exception as exc:
         logger.warning("Calendario macro inicial: %s", exc)
 
     print(f"✅ Sistemas listos. Activos: {symbols}")
+    print(f"   Vetos: mercado | PIN | macro | forense | whale | spread | montecarlo")
+    print(f"   Ejecución: TWAP automático para qty > 1")
 
     await asyncio.gather(
         dashboard.run(),
@@ -1168,6 +1557,7 @@ async def main() -> None:
         whale.run_loop(symbols),
         trading.scan_and_trade(symbols),
         bot.run_polling(),
+        retrain.run_loop(),
         return_exceptions=True,
     )
 
