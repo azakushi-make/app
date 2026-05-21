@@ -1,0 +1,7 @@
+config_alpaca.json
+brain/
+logs/
+env/
+__pycache__/
+*.pkl
+*.pyc

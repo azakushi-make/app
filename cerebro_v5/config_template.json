@@ -1,0 +1,68 @@
+{
+  "_version": "5.0",
+  "_descripcion": "Cerebro Quant v5 — Rellena tus credenciales y renombra a config_alpaca.json",
+
+  "telegram": {
+    "_instruccion": "Obtén el token con @BotFather en Telegram",
+    "token": "TU_TELEGRAM_BOT_TOKEN_AQUI",
+    "chat_id": "TU_CHAT_ID_AQUI"
+  },
+
+  "alpaca": {
+    "_instruccion": "Crea cuenta en alpaca.markets → Paper Trading → API Keys",
+    "api_key": "TU_ALPACA_API_KEY_AQUI",
+    "secret_key": "TU_ALPACA_SECRET_KEY_AQUI",
+    "paper_trading": true,
+    "base_url": "https://paper-api.alpaca.markets",
+    "simbolo_principal": "SPY"
+  },
+
+  "market_data": {
+    "_instruccion": "Todas son gratuitas con registro",
+    "alpha_vantage_key": "TU_ALPHA_VANTAGE_KEY_AQUI",
+    "twelvedata_key": "TU_TWELVEDATA_KEY_AQUI",
+    "finnhub_key": "TU_FINNHUB_KEY_AQUI",
+    "news_api_key": "TU_NEWSAPI_KEY_AQUI"
+  },
+
+  "groq": {
+    "_instruccion": "API gratuita en console.groq.com",
+    "api_key": "TU_GROQ_API_KEY_AQUI",
+    "model": "llama-3.3-70b-versatile"
+  },
+
+  "capital": {
+    "balance_demo": 29.16,
+    "capital_alpaca": 25000.00,
+    "risk_percent": 2.0,
+    "max_position_size": 0.05,
+    "stop_loss_fixed_usd": 10.00
+  },
+
+  "trading_params": {
+    "modo": "paper_trading",
+    "nivel_riesgo": "conservador",
+    "min_confidence_signal": 65,
+    "min_confidence_execution": 70,
+    "max_trades_per_day": 5,
+    "timezone": "America/New_York",
+    "simbolos": ["SPY", "QQQ"]
+  },
+
+  "interface": {
+    "theme": "dark",
+    "responsive": true,
+    "show_debug": false,
+    "update_interval_ms": 500,
+    "log_level": "INFO"
+  },
+
+  "calibraciones": {},
+
+  "persistent_state": {
+    "last_update": "",
+    "session_trades": 0,
+    "session_pnl": 0.0,
+    "cardinal_confidence": 0.0
+  }
+}
