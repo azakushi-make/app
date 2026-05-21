@@ -1,55 +1,95 @@
 #!/usr/bin/env bash
-# ══════════════════════════════════════════════
-#  CEREBRO QUANT v5 — Instalador Automático
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+#  CEREBRO QUANT v5 — Automatic Installer
+#  Supports: Termux (Android) and standard Linux/macOS
+# ══════════════════════════════════════════════════════════
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 echo ""
-echo "╔══════════════════════════════════════════╗"
-echo "║   🧠  CEREBRO QUANT v5  —  INSTALADOR    ║"
-echo "╚══════════════════════════════════════════╝"
+echo "╔══════════════════════════════════════════════════╗"
+echo "║      CEREBRO QUANT v5  —  INSTALLER             ║"
+echo "╚══════════════════════════════════════════════════╝"
 echo ""
 
-# ── Detectar entorno ──────────────────────────
+# ── Detect environment ────────────────────────────────────
 if [ -n "$TERMUX_VERSION" ]; then
-    echo "📱 Detectado: Termux (Android)"
-    pkg update -y && pkg install python3 -y 2>/dev/null || true
+    echo "[INFO] Detected: Termux (Android)"
+    echo "[INFO] Updating Termux packages..."
+    pkg update -y 2>/dev/null || true
+    pkg install python3 python-pip -y 2>/dev/null || true
+    PYTHON_CMD="python3"
+elif command -v python3 &>/dev/null; then
+    echo "[INFO] Detected: Linux / macOS"
+    PYTHON_CMD="python3"
 else
-    echo "🖥️  Detectado: Linux/macOS"
+    echo "[ERROR] python3 not found. Please install Python 3.9+."
+    exit 1
 fi
 
-# ── Crear entorno virtual ─────────────────────
-echo "📦 Creando entorno virtual..."
-python3 -m venv env
-source env/bin/activate
+echo "[INFO] Python: $($PYTHON_CMD --version)"
 
-# ── Instalar dependencias ──────────────────────
-echo "📥 Instalando dependencias..."
-pip install --upgrade pip -q
-pip install -r requirements.txt -q
-echo "✅ Dependencias instaladas"
+# ── Create virtual environment ────────────────────────────
+echo ""
+echo "[STEP 1/4] Creating virtual environment in env/ ..."
+$PYTHON_CMD -m venv env
 
-# ── Crear directorios ─────────────────────────
+# Activate
+if [ -f "env/bin/activate" ]; then
+    # shellcheck disable=SC1091
+    source env/bin/activate
+elif [ -f "env/Scripts/activate" ]; then
+    # Windows Git Bash
+    # shellcheck disable=SC1091
+    source env/Scripts/activate
+fi
+
+echo "[OK] Virtual environment created and activated"
+
+# ── Install dependencies ──────────────────────────────────
+echo ""
+echo "[STEP 2/4] Installing dependencies from requirements.txt ..."
+pip install --upgrade pip --quiet
+pip install -r requirements.txt --quiet
+echo "[OK] Dependencies installed"
+
+# ── Create directories ────────────────────────────────────
+echo ""
+echo "[STEP 3/4] Creating required directories ..."
 mkdir -p brain logs
-echo "📁 Directorios creados: brain/ logs/"
+echo "[OK] Created: brain/  logs/"
 
-# ── Config inicial ────────────────────────────
+# ── Copy config template if needed ───────────────────────
+echo ""
+echo "[STEP 4/4] Checking configuration ..."
 if [ ! -f "config_alpaca.json" ]; then
-    cp config_template.json config_alpaca.json
-    echo ""
-    echo "⚠️  ACCIÓN REQUERIDA:"
-    echo "   Edita config_alpaca.json con tus credenciales:"
-    echo "   nano config_alpaca.json"
+    if [ -f "config_template.json" ]; then
+        cp config_template.json config_alpaca.json
+        echo "[OK] Copied config_template.json → config_alpaca.json"
+        echo ""
+        echo "  ┌──────────────────────────────────────────────────────┐"
+        echo "  │  ACTION REQUIRED: Fill in your credentials           │"
+        echo "  │                                                      │"
+        echo "  │  Edit config_alpaca.json and replace all             │"
+        echo "  │  YOUR_*_HERE placeholders with real values.          │"
+        echo "  │                                                      │"
+        echo "  │  nano config_alpaca.json                             │"
+        echo "  └──────────────────────────────────────────────────────┘"
+    else
+        echo "[WARN] config_template.json not found. Create config_alpaca.json manually."
+    fi
 else
-    echo "✅ config_alpaca.json ya existe"
+    echo "[OK] config_alpaca.json already exists"
 fi
 
 echo ""
-echo "╔══════════════════════════════════════════╗"
-echo "║   ✅  INSTALACIÓN COMPLETA               ║"
-echo "║                                          ║"
-echo "║   Para ejecutar:                         ║"
-echo "║     source env/bin/activate              ║"
-echo "║     python main.py                       ║"
-echo "╚══════════════════════════════════════════╝"
+echo "╔══════════════════════════════════════════════════╗"
+echo "║   Installation complete.                         ║"
+echo "║                                                  ║"
+echo "║   Edit config_alpaca.json then run:              ║"
+echo "║     source env/bin/activate                      ║"
+echo "║     python main.py                               ║"
+echo "╚══════════════════════════════════════════════════╝"
 echo ""

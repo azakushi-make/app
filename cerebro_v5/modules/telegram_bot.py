@@ -44,7 +44,9 @@ class TelegramBot:
             logger.warning("TelegramBot: no token configured — bot disabled")
             self.application = None
 
-    def _register_handlers(self):
+    def _register_handlers(self) -> None:
+        if self.application is None:
+            return
         self.application.add_handler(CommandHandler("start", self.cmd_start))
         self.application.add_handler(CommandHandler("status", self.cmd_status))
         self.application.add_handler(CommandHandler("macro", self.cmd_macro))
@@ -165,24 +167,45 @@ class TelegramBot:
 
     # ─── ALERT SENDER ─────────────────────────────────────────────────────────
 
-    async def send_alert(self, message: str):
+    async def send_alert(self, message: str) -> None:
+        """Send an alert to the configured chat_id. Safe to call even if bot is disabled."""
+        if self.application is None or not self.chat_id:
+            logger.debug("TelegramBot.send_alert: bot not configured, skipping")
+            return
         try:
-            bot = self.application.bot
-            await bot.send_message(chat_id=self.chat_id, text=f"🚨 ALERTA\n\n{message}")
+            await self.application.bot.send_message(
+                chat_id=self.chat_id,
+                text=f"🚨 ALERTA\n\n{message}",
+            )
         except Exception as e:
-            logger.error(f"Error enviando alerta Telegram: {e}")
+            logger.error("Error enviando alerta Telegram: %s", e)
 
     # ─── START POLLING ────────────────────────────────────────────────────────
 
-    async def run_polling(self):
-        logger.info("📡 Telegram bot iniciando polling...")
-        await self.application.initialize()
-        await self.application.start()
-        await self.application.updater.start_polling(drop_pending_updates=True)
+    async def run_polling(self) -> None:
+        """Start polling. If bot is not configured, keeps the coroutine alive silently."""
+        if self.application is None:
+            logger.warning("TelegramBot: polling skipped (not configured)")
+            while True:
+                await asyncio.sleep(60)
+            return
+
+        logger.info("TelegramBot: starting polling...")
         try:
+            await self.application.initialize()
+            await self.application.start()
+            await self.application.updater.start_polling(drop_pending_updates=True)
             while True:
                 await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            logger.info("TelegramBot: polling cancelled")
+        except Exception as e:
+            logger.error("TelegramBot.run_polling error: %s", e)
         finally:
-            await self.application.updater.stop()
-            await self.application.stop()
-            await self.application.shutdown()
+            try:
+                if self.application.updater.running:
+                    await self.application.updater.stop()
+                await self.application.stop()
+                await self.application.shutdown()
+            except Exception as shutdown_exc:
+                logger.error("TelegramBot shutdown error: %s", shutdown_exc)

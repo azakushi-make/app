@@ -1,38 +1,40 @@
 {
   "_version": "5.0",
-  "_descripcion": "Cerebro Quant v5 — Rellena tus credenciales y renombra a config_alpaca.json",
+  "_instructions": {
+    "overview": "Cerebro Quant v5 configuration template. Copy this file to config_alpaca.json and replace every YOUR_*_HERE value with your actual credentials.",
+    "telegram_section": "Create a Telegram bot via @BotFather to get the token. Find your chat_id by messaging @userinfobot.",
+    "alpaca_section": "Sign up at alpaca.markets. Use paper-api.alpaca.markets for paper trading. Get API keys from the Alpaca dashboard.",
+    "market_data_section": "Register at twelvedata.com, finnhub.io for free API keys. All three price sources are optional — the system falls back gracefully.",
+    "groq_section": "Get a free API key at console.groq.com. The llama-3.3-70b-versatile model is free-tier eligible.",
+    "trading_params_section": "simbolos: list of ticker symbols to trade. min_confidence: minimum committee vote confidence (0-100) required to place an order.",
+    "hf_token_note": "If you want to export the forensic dataset to HuggingFace, set the HF_TOKEN environment variable (never put it in this config file)."
+  },
 
   "telegram": {
-    "_instruccion": "Obtén el token con @BotFather en Telegram",
-    "token": "TU_TELEGRAM_BOT_TOKEN_AQUI",
-    "chat_id": "TU_CHAT_ID_AQUI"
+    "token": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
+    "chat_id": "YOUR_TELEGRAM_CHAT_ID_HERE"
   },
 
   "alpaca": {
-    "_instruccion": "Crea cuenta en alpaca.markets → Paper Trading → API Keys",
-    "api_key": "TU_ALPACA_API_KEY_AQUI",
-    "secret_key": "TU_ALPACA_SECRET_KEY_AQUI",
+    "api_key": "YOUR_ALPACA_API_KEY_HERE",
+    "secret_key": "YOUR_ALPACA_SECRET_KEY_HERE",
     "paper_trading": true,
     "base_url": "https://paper-api.alpaca.markets",
     "simbolo_principal": "SPY"
   },
 
   "market_data": {
-    "_instruccion": "Todas son gratuitas con registro",
-    "alpha_vantage_key": "TU_ALPHA_VANTAGE_KEY_AQUI",
-    "twelvedata_key": "TU_TWELVEDATA_KEY_AQUI",
-    "finnhub_key": "TU_FINNHUB_KEY_AQUI",
-    "news_api_key": "TU_NEWSAPI_KEY_AQUI"
+    "twelvedata_key": "YOUR_TWELVEDATA_API_KEY_HERE",
+    "finnhub_key": "YOUR_FINNHUB_API_KEY_HERE",
+    "news_api_key": "YOUR_NEWSAPI_KEY_HERE_OPTIONAL"
   },
 
   "groq": {
-    "_instruccion": "API gratuita en console.groq.com",
-    "api_key": "TU_GROQ_API_KEY_AQUI",
+    "api_key": "YOUR_GROQ_API_KEY_HERE",
     "model": "llama-3.3-70b-versatile"
   },
 
   "capital": {
-    "balance_demo": 29.16,
     "capital_alpaca": 25000.00,
     "risk_percent": 2.0,
     "max_position_size": 0.05,
@@ -40,24 +42,23 @@
   },
 
   "trading_params": {
+    "simbolos": ["SPY", "QQQ"],
     "modo": "paper_trading",
     "nivel_riesgo": "conservador",
+    "min_confidence": 65,
     "min_confidence_signal": 65,
     "min_confidence_execution": 70,
     "max_trades_per_day": 5,
-    "timezone": "America/New_York",
-    "simbolos": ["SPY", "QQQ"]
+    "order_qty": 1,
+    "timezone": "America/New_York"
   },
 
   "interface": {
     "theme": "dark",
-    "responsive": true,
     "show_debug": false,
     "update_interval_ms": 500,
     "log_level": "INFO"
   },
-
-  "calibraciones": {},
 
   "persistent_state": {
     "last_update": "",
